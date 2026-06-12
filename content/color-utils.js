@@ -51,6 +51,16 @@ const OKLCHColorUtils = (() => {
     "normal",
   ]);
 
+  let colorCanvasContext = null;
+
+  function getColorContext() {
+    if (!colorCanvasContext) {
+      const canvas = document.createElement("canvas");
+      colorCanvasContext = canvas.getContext("2d");
+    }
+    return colorCanvasContext;
+  }
+
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
   }
@@ -119,18 +129,8 @@ const OKLCHColorUtils = (() => {
     };
   }
 
-  function parseCssColor(value) {
-    if (!value || typeof value !== "string") return null;
-    const trimmed = value.trim();
-    if (!trimmed || NON_COLOR_KEYWORDS.has(trimmed.toLowerCase())) return null;
-
-    const probe = document.createElement("span");
-    probe.style.color = "";
-    probe.style.color = trimmed;
-    if (!probe.style.color) return null;
-
-    const computed = getComputedStyle(probe).color;
-    const match = computed.match(/rgba?\(([^)]+)\)/);
+  function parseRgbString(value) {
+    const match = value.match(/rgba?\(([^)]+)\)/i);
     if (!match) return null;
 
     const parts = match[1].split(",").map((part) => part.trim());
@@ -140,18 +140,73 @@ const OKLCHColorUtils = (() => {
     const alpha = parts[3] !== undefined ? Number.parseFloat(parts[3]) : 1;
 
     if ([r, g, b, alpha].some((n) => Number.isNaN(n))) return null;
-    return { r, g, b, alpha, original: trimmed };
+    return { r, g, b, alpha, original: value };
   }
 
-  function transformColor(originalValue, adjustments) {
-    const parsed = parseCssColor(originalValue);
-    if (!parsed) return originalValue;
+  function parseHexString(value) {
+    const match = value.match(/^#([0-9a-fA-F]{3,8})$/);
+    if (!match) return null;
 
+    let hex = match[1];
+    if (hex.length === 3) {
+      hex = hex
+        .split("")
+        .map((ch) => ch + ch)
+        .join("");
+    }
+
+    const r = Number.parseInt(hex.slice(0, 2), 16);
+    const g = Number.parseInt(hex.slice(2, 4), 16);
+    const b = Number.parseInt(hex.slice(4, 6), 16);
+    const alpha = hex.length >= 8 ? Number.parseInt(hex.slice(6, 8), 16) / 255 : 1;
+
+    if ([r, g, b, alpha].some((n) => Number.isNaN(n))) return null;
+    return { r, g, b, alpha, original: value };
+  }
+
+  function parseCssColor(value) {
+    if (!value || typeof value !== "string") return null;
+    const trimmed = value.trim();
+    if (!trimmed || NON_COLOR_KEYWORDS.has(trimmed.toLowerCase())) return null;
+
+    const rgbParsed = parseRgbString(trimmed);
+    if (rgbParsed) return rgbParsed;
+
+    const hexParsed = parseHexString(trimmed);
+    if (hexParsed) return hexParsed;
+
+    const ctx = getColorContext();
+    if (!ctx) return null;
+
+    try {
+      ctx.fillStyle = "#010101";
+      ctx.fillStyle = trimmed;
+    } catch {
+      return null;
+    }
+
+    const normalized = ctx.fillStyle;
+    if (normalized.startsWith("#")) {
+      return parseHexString(normalized);
+    }
+    return parseRgbString(normalized);
+  }
+
+  function isTransparent(parsed) {
+    return parsed.alpha === 0;
+  }
+
+  function transformParsedColor(parsed, adjustments) {
     const lab = rgbToOklab(parsed.r, parsed.g, parsed.b);
     const oklch = oklabToOklch(lab.L, lab.a, lab.b);
 
+    // Uniform shift keeps palette relationships — page reads as one intentional theme.
     const nextL = clamp(oklch.L + adjustments.lightness / 100, 0, 1);
-    const nextC = clamp(oklch.C + adjustments.chroma / 100, 0, 0.4);
+    const nextC = clamp(
+      oklch.C * (1 + adjustments.chroma / 100),
+      0,
+      0.4
+    );
     let nextH = oklch.H + adjustments.hue;
     nextH = ((nextH % 360) + 360) % 360;
 
@@ -164,6 +219,12 @@ const OKLCHColorUtils = (() => {
     return `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`;
   }
 
+  function transformColor(originalValue, adjustments) {
+    const parsed = parseCssColor(originalValue);
+    if (!parsed || isTransparent(parsed)) return originalValue;
+    return transformParsedColor(parsed, adjustments);
+  }
+
   const COLOR_PATTERN =
     /(?:oklch|oklab|lab|lch|hsl|hwb|rgb|rgba|color)\([^)]+\)|#(?:[0-9a-fA-F]{3,8})\b|\b[a-zA-Z]+\b/;
 
@@ -173,12 +234,13 @@ const OKLCHColorUtils = (() => {
     if (NON_COLOR_KEYWORDS.has(lower)) return value;
 
     return value.replace(new RegExp(COLOR_PATTERN.source, "g"), (token) => {
-      if (!parseCssColor(token)) return token;
+      const parsed = parseCssColor(token);
+      if (!parsed || isTransparent(parsed)) return token;
 
       const key = `${token}::${adjustments.hue}:${adjustments.lightness}:${adjustments.chroma}`;
       if (cache.has(key)) return cache.get(key);
 
-      const transformed = transformColor(token, adjustments);
+      const transformed = transformParsedColor(parsed, adjustments);
       cache.set(key, transformed);
       return transformed;
     });
@@ -200,10 +262,25 @@ const OKLCHColorUtils = (() => {
     return property.startsWith("--");
   }
 
+  function isTransformableValue(value, property) {
+    if (!value || typeof value !== "string") return false;
+    const trimmed = value.trim();
+    if (!trimmed || NON_COLOR_KEYWORDS.has(trimmed.toLowerCase())) return false;
+
+    if (property.startsWith("--")) {
+      return looksLikeColorValue(trimmed);
+    }
+
+    if (/^var\s*\(/i.test(trimmed)) return false;
+
+    return looksLikeColorValue(trimmed);
+  }
+
   return {
     COLOR_PROPERTIES,
     isColorProperty,
     isCustomColorProperty,
+    isTransformableValue,
     looksLikeColorValue,
     transformColor,
     replaceColorsInValue,

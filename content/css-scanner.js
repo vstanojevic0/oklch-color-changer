@@ -1,21 +1,32 @@
 const CSSScanner = (() => {
-  const { isColorProperty, isCustomColorProperty, looksLikeColorValue } =
+  const { isColorProperty, isCustomColorProperty, isTransformableValue } =
     OKLCHColorUtils;
 
+  const STYLE_ID = "oklch-color-changer-overrides";
+
+  function isExtensionNode(node) {
+    if (!(node instanceof Element)) return false;
+    return node.id === STYLE_ID || node.dataset?.oklchExtension === "true";
+  }
+
   function createBucket() {
-    return {
-      stylesheetRules: [],
-      keyframeRules: [],
-      inlineRules: [],
-      warnings: [],
-    };
+    return { rules: [], keyframes: [], inlineRules: [] };
   }
 
   async function fetchStylesheetText(href) {
     try {
       const response = await fetch(href, { credentials: "include" });
-      if (!response.ok) return null;
-      return await response.text();
+      if (response.ok) return await response.text();
+    } catch {
+      // Try extension background fetch (no page CORS).
+    }
+
+    try {
+      const result = await chrome.runtime.sendMessage({
+        type: "FETCH_CSS",
+        url: href,
+      });
+      return result?.text || null;
     } catch {
       return null;
     }
@@ -27,22 +38,21 @@ const CSSScanner = (() => {
     for (const rule of rules) {
       if (rule.type === CSSRule.STYLE_RULE) {
         const declarations = [];
+
         for (let i = 0; i < rule.style.length; i += 1) {
           const property = rule.style[i];
           const isColorProp =
             isColorProperty(property) || isCustomColorProperty(property);
           if (!isColorProp) continue;
+
           const value = rule.style.getPropertyValue(property);
-          if (!looksLikeColorValue(value)) continue;
-          declarations.push({
-            property,
-            value: value.trim(),
-            important: rule.style.getPropertyPriority(property) === "important",
-          });
+          if (!isTransformableValue(value, property)) continue;
+
+          declarations.push({ property, value: value.trim() });
         }
 
-        if (declarations.length > 0) {
-          bucket.stylesheetRules.push({
+        if (declarations.length > 0 && rule.selectorText) {
+          bucket.rules.push({
             selector: rule.selectorText,
             declarations,
             mediaStack: [...mediaStack],
@@ -59,22 +69,22 @@ const CSSScanner = (() => {
       } else if (rule.type === CSSRule.KEYFRAMES_RULE) {
         for (const keyframe of rule.cssRules) {
           if (keyframe.type !== CSSRule.KEYFRAME_RULE) continue;
+
           const declarations = [];
           for (let i = 0; i < keyframe.style.length; i += 1) {
             const property = keyframe.style[i];
             const isColorProp =
               isColorProperty(property) || isCustomColorProperty(property);
             if (!isColorProp) continue;
+
             const value = keyframe.style.getPropertyValue(property);
-            if (!looksLikeColorValue(value)) continue;
-            declarations.push({
-              property,
-              value: value.trim(),
-              important: keyframe.style.getPropertyPriority(property) === "important",
-            });
+            if (!isTransformableValue(value, property)) continue;
+
+            declarations.push({ property, value: value.trim() });
           }
+
           if (declarations.length > 0) {
-            bucket.keyframeRules.push({
+            bucket.keyframes.push({
               name: rule.name,
               keyText: keyframe.keyText,
               declarations,
@@ -85,53 +95,56 @@ const CSSScanner = (() => {
     }
   }
 
+  function parseCssText(cssText, bucket) {
+    if (!cssText) return;
+
+    const styleEl = document.createElement("style");
+    styleEl.textContent = cssText;
+    document.documentElement.appendChild(styleEl);
+    try {
+      walkRules(styleEl.sheet?.cssRules, bucket);
+    } finally {
+      styleEl.remove();
+    }
+  }
+
   async function collectFromStylesheet(sheet, bucket) {
     if (!sheet) return;
 
     try {
       if (sheet.cssRules) {
         walkRules(sheet.cssRules, bucket);
-        return;
       }
     } catch {
-      // Cross-origin sheet; fall through to fetch/inline parsing.
+      // Cross-origin — fetch below.
     }
 
     const ownerNode = sheet.ownerNode;
     if (ownerNode?.tagName === "STYLE" && ownerNode.textContent) {
-      parseCssText(ownerNode.textContent, bucket, "[inline-style-tag]");
+      parseCssText(ownerNode.textContent, bucket);
       return;
     }
 
     if (sheet.href) {
       const cssText = await fetchStylesheetText(sheet.href);
-      if (cssText) parseCssText(cssText, bucket, sheet.href);
+      parseCssText(cssText, bucket);
     }
   }
 
-  function parseCssText(cssText, bucket, sourceLabel) {
-    const styleEl = document.createElement("style");
-    styleEl.textContent = cssText;
-    document.documentElement.appendChild(styleEl);
-    try {
-      walkRules(styleEl.sheet?.cssRules, bucket);
-    } catch {
-      bucket.warnings.push(`Neuspelo parsiranje: ${sourceLabel}`);
-    } finally {
-      styleEl.remove();
-    }
-  }
+  function collectInlineStyles(root, bucket, inlineState) {
+    root.querySelectorAll("[style]").forEach((element) => {
+      if (isExtensionNode(element)) return;
 
-  function collectInlineStyles(root, bucket) {
-    root.querySelectorAll("[style]").forEach((element, index) => {
       const declarations = [];
       for (let i = 0; i < element.style.length; i += 1) {
         const property = element.style[i];
         const isColorProp =
           isColorProperty(property) || isCustomColorProperty(property);
         if (!isColorProp) continue;
+
         const value = element.style.getPropertyValue(property);
-        if (!looksLikeColorValue(value)) continue;
+        if (!isTransformableValue(value, property)) continue;
+
         declarations.push({
           property,
           value: value.trim(),
@@ -141,24 +154,46 @@ const CSSScanner = (() => {
 
       if (declarations.length === 0) return;
 
-      const marker = element.dataset.oklchInline;
-      const inlineIndex = marker ?? `${root === document ? "d" : "s"}-${index}`;
-
-      if (!marker) {
-        element.dataset.oklchInline = inlineIndex;
+      let selector;
+      if (element.id) {
+        selector = `#${CSS.escape(element.id)}`;
+      } else {
+        inlineState.counter += 1;
+        selector = `[data-oklch-inline="${inlineState.counter}"]`;
+        element.setAttribute("data-oklch-inline", String(inlineState.counter));
       }
 
-      const selector = element.id
-        ? `#${CSS.escape(element.id)}`
-        : `[data-oklch-inline="${CSS.escape(inlineIndex)}"]`;
+      bucket.inlineRules.push({ selector, declarations });
+    });
+  }
 
-      bucket.inlineRules.push({ selector, element, declarations });
+  function isSelectorValid(selector) {
+    try {
+      document.querySelector(selector);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function dedupeRules(bucket) {
+    const seen = new Set();
+
+    bucket.rules = bucket.rules.filter((rule) => {
+      if (!isSelectorValid(rule.selector)) return false;
+      const key = `${rule.mediaStack.join("|")}::${rule.selector}::${rule.declarations
+        .map((d) => `${d.property}:${d.value}`)
+        .join(";")}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
     });
   }
 
   async function scanRoot(root) {
     const bucket = createBucket();
     const sheets = new Set();
+    const inlineState = { counter: 0 };
 
     for (const sheet of root.styleSheets || []) {
       sheets.add(sheet);
@@ -171,13 +206,20 @@ const CSSScanner = (() => {
     }
 
     root.querySelectorAll("style").forEach((node) => {
-      if (node.sheet) sheets.add(node.sheet);
+      if (!isExtensionNode(node) && node.sheet) sheets.add(node.sheet);
     });
 
-    await Promise.all([...sheets].map((sheet) => collectFromStylesheet(sheet, bucket)));
-    collectInlineStyles(root, bucket);
+    if (root === document) {
+      document.querySelectorAll('link[rel="stylesheet"]').forEach((link) => {
+        if (link.sheet) sheets.add(link.sheet);
+      });
+    }
 
-    return bucket;
+    await Promise.all([...sheets].map((sheet) => collectFromStylesheet(sheet, bucket)));
+    collectInlineStyles(root, bucket, inlineState);
+    dedupeRules(bucket);
+
+    return { root, bucket };
   }
 
   function discoverShadowRoots() {
@@ -197,30 +239,24 @@ const CSSScanner = (() => {
     return shadowRoots;
   }
 
-  async function scanDocument() {
-    const targets = [{ root: document, bucket: createBucket() }];
+  async function scanAllCss() {
+    const targets = [document];
 
     for (const shadowRoot of discoverShadowRoots()) {
-      targets.push({ root: shadowRoot, bucket: createBucket() });
+      targets.push(shadowRoot);
     }
 
-    await Promise.all(
-      targets.map(async (target) => {
-        const scanned = await scanRoot(target.root);
-        target.bucket = scanned;
-      })
-    );
+    const scanned = await Promise.all(targets.map((root) => scanRoot(root)));
 
     const merged = createBucket();
-    for (const target of targets) {
-      merged.stylesheetRules.push(...target.bucket.stylesheetRules);
-      merged.keyframeRules.push(...target.bucket.keyframeRules);
-      merged.inlineRules.push(...target.bucket.inlineRules);
-      merged.warnings.push(...target.bucket.warnings);
+    for (const { bucket } of scanned) {
+      merged.rules.push(...bucket.rules);
+      merged.keyframes.push(...bucket.keyframes);
+      merged.inlineRules.push(...bucket.inlineRules);
     }
 
-    return { targets, merged };
+    return { targets: scanned, merged };
   }
 
-  return { scanDocument };
+  return { scanAllCss, discoverShadowRoots, STYLE_ID };
 })();

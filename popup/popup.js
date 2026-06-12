@@ -8,6 +8,12 @@ const statsEl = document.getElementById("stats");
 const resetBtn = document.getElementById("reset");
 const rescanBtn = document.getElementById("rescan");
 
+const CONTENT_SCRIPTS = [
+  "content/color-utils.js",
+  "content/css-scanner.js",
+  "content/content.js",
+];
+
 function getAdjustments() {
   return {
     hue: Number(hueInput.value),
@@ -24,10 +30,14 @@ function updateOutputs() {
 
 function renderStats(stats) {
   if (!stats) {
-    statsEl.textContent = "Nema podataka sa stranice.";
+    statsEl.textContent = "Osveži stranicu (F5) pa otvori popup.";
     return;
   }
-  statsEl.textContent = `Pronađeno: ${stats.rules} CSS pravila, ${stats.keyframes} keyframe-a, ${stats.inline} inline stilova.`;
+  if (stats.rules === 0 && stats.inline === 0) {
+    statsEl.textContent = "0 CSS boja — sajt koristi samo var() ili blokirane stylesheet-ove.";
+    return;
+  }
+  statsEl.textContent = `${stats.rules} CSS pravila, ${stats.inline} inline. Pomeri Hue.`;
 }
 
 async function getActiveTab() {
@@ -35,15 +45,43 @@ async function getActiveTab() {
   return tab;
 }
 
+async function injectContentScripts(tabId) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: CONTENT_SCRIPTS,
+  });
+
+  for (let i = 0; i < 30; i += 1) {
+    try {
+      const ping = await chrome.tabs.sendMessage(tabId, { type: "PING" });
+      if (ping?.ok) return true;
+    } catch {
+      // waiting
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
 async function sendToContent(message) {
   const tab = await getActiveTab();
   if (!tab?.id) return null;
+
+  const url = tab.url || "";
+  if (url.startsWith("chrome://") || url.startsWith("chrome-extension://")) {
+    statsEl.textContent = "Ne radi na internim stranicama.";
+    return null;
+  }
+
   try {
     return await chrome.tabs.sendMessage(tab.id, message);
   } catch {
-    statsEl.textContent =
-      "Content script nije aktivan na ovoj stranici. Osveži stranicu pa pokušaj ponovo.";
-    return null;
+    const ready = await injectContentScripts(tab.id);
+    if (!ready) {
+      statsEl.textContent = "Osveži stranicu (F5).";
+      return null;
+    }
+    return await chrome.tabs.sendMessage(tab.id, message);
   }
 }
 
@@ -51,7 +89,13 @@ async function pushAdjustments() {
   updateOutputs();
   const adjustments = getAdjustments();
   await chrome.storage.local.set({ oklchAdjustments: adjustments });
-  await sendToContent({ type: "SET_ADJUSTMENTS", adjustments });
+  const response = await sendToContent({ type: "SET_ADJUSTMENTS", adjustments });
+  if (response?.stats) renderStats(response.stats);
+  if (response?.applied?.reason === "empty css") {
+    statsEl.textContent = "CSS skeniran ali nema transformabilnih boja. Klikni Ponovo skeniraj.";
+  } else if (response?.applied && response.applied.ok === false) {
+    statsEl.textContent = `Greška: ${response.applied.reason || "primena nije uspela"}`;
+  }
 }
 
 async function loadState() {
@@ -65,6 +109,10 @@ async function loadState() {
 
   const response = await sendToContent({ type: "GET_STATE" });
   if (response?.stats) renderStats(response.stats);
+
+  if (adjustments.hue !== 0 || adjustments.lightness !== 0 || adjustments.chroma !== 0) {
+    await pushAdjustments();
+  }
 }
 
 [hueInput, lightnessInput, chromaInput].forEach((input) => {
@@ -81,9 +129,7 @@ resetBtn.addEventListener("click", async () => {
 rescanBtn.addEventListener("click", async () => {
   statsEl.textContent = "Skeniram CSS…";
   const response = await sendToContent({ type: "RESCAN" });
-  if (response) {
-    renderStats(response);
-  }
+  if (response) renderStats(response);
 });
 
 loadState();

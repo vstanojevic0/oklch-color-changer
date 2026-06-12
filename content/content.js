@@ -1,183 +1,199 @@
 (() => {
-  const STYLE_ID = "oklch-color-changer-overrides";
+  const STATE = (window.__OKLCH_COLOR_CHANGER__ ||= {
+    initialized: false,
+    listenerRegistered: false,
+  });
+
+  const STYLE_ID = CSSScanner.STYLE_ID;
   const { replaceColorsInValue } = OKLCHColorUtils;
 
-  let scanResult = null;
+  let baseline = null;
   let adjustments = { hue: 0, lightness: 0, chroma: 0 };
-  let rescanTimer = null;
 
-  function isNeutral(currentAdjustments) {
-    return (
-      currentAdjustments.hue === 0 &&
-      currentAdjustments.lightness === 0 &&
-      currentAdjustments.chroma === 0
-    );
+  function isNeutral(adj) {
+    return adj.hue === 0 && adj.lightness === 0 && adj.chroma === 0;
   }
 
-  function ensureOverrideElement(root) {
-    const isDocument = root === document;
-    const parent = isDocument
-      ? document.body || document.documentElement
-      : root;
-
-    let styleEl = isDocument
-      ? document.getElementById(STYLE_ID)
-      : root.querySelector(`#${STYLE_ID}`);
-
-    if (!styleEl) {
-      styleEl = document.createElement("style");
-      styleEl.id = STYLE_ID;
-      styleEl.dataset.oklchExtension = "true";
-      parent.appendChild(styleEl);
-    } else if (styleEl.parentNode !== parent) {
-      parent.appendChild(styleEl);
-    }
-
-    return styleEl;
-  }
-
-  function buildStylesheetCss(bucket, currentAdjustments) {
+  function buildOverrideCss(bucket, adj) {
     const cache = new Map();
     const chunks = [];
 
-    for (const rule of bucket.stylesheetRules) {
+    for (const rule of bucket.rules) {
       const body = rule.declarations
         .map(({ property, value }) => {
-          const nextValue = replaceColorsInValue(value, currentAdjustments, cache);
-          return `  ${property}: ${nextValue} !important;`;
+          const next = replaceColorsInValue(value, adj, cache);
+          return `  ${property}: ${next} !important;`;
         })
         .join("\n");
 
-      if (rule.mediaStack.length > 0) {
-        let wrapped = `${rule.selector} {\n${body}\n}`;
-        for (let i = rule.mediaStack.length - 1; i >= 0; i -= 1) {
-          wrapped = `@media ${rule.mediaStack[i]} {\n${wrapped}\n}`;
-        }
-        chunks.push(wrapped);
-      } else {
-        chunks.push(`${rule.selector} {\n${body}\n}`);
+      let block = `${rule.selector} {\n${body}\n}`;
+
+      for (let i = rule.mediaStack.length - 1; i >= 0; i -= 1) {
+        block = `@media ${rule.mediaStack[i]} {\n${block}\n}`;
       }
+
+      chunks.push(block);
     }
 
-    for (const rule of bucket.keyframeRules) {
-      const body = rule.declarations
+    for (const kf of bucket.keyframes) {
+      const body = kf.declarations
         .map(({ property, value }) => {
-          const nextValue = replaceColorsInValue(value, currentAdjustments, cache);
-          return `  ${property}: ${nextValue} !important;`;
+          const next = replaceColorsInValue(value, adj, cache);
+          return `${property}: ${next} !important;`;
+        })
+        .join(" ");
+
+      chunks.push(`@keyframes ${kf.name} { ${kf.keyText} { ${body} } }`);
+    }
+
+    for (const inline of bucket.inlineRules) {
+      const body = inline.declarations
+        .map(({ property, value }) => {
+          const next = replaceColorsInValue(value, adj, cache);
+          return `  ${property}: ${next} !important;`;
         })
         .join("\n");
-      chunks.push(
-        `@keyframes ${rule.name} { ${rule.keyText} { ${body.replace(/\n/g, " ")} } }`
-      );
+
+      chunks.push(`${inline.selector} {\n${body}\n}`);
     }
 
     return chunks.join("\n\n");
   }
 
-  function applyInlineOverrides(bucket, currentAdjustments) {
-    const cache = new Map();
-    const neutral = isNeutral(currentAdjustments);
+  function removeStyleTag(root) {
+    const isDocument = root === document;
+    const el = isDocument
+      ? document.getElementById(STYLE_ID)
+      : root.querySelector(`#${STYLE_ID}`);
+    el?.remove();
+  }
 
-    for (const rule of bucket.inlineRules) {
-      if (!rule.element?.isConnected) continue;
-      for (const { property, value, important } of rule.declarations) {
-        if (neutral) {
-          rule.element.style.setProperty(
-            property,
-            value,
-            important ? "important" : ""
-          );
-        } else {
-          const nextValue = replaceColorsInValue(value, currentAdjustments, cache);
-          rule.element.style.setProperty(property, nextValue, "important");
-        }
-      }
+  function removeAllOverrides() {
+    removeStyleTag(document);
+    for (const shadowRoot of CSSScanner.discoverShadowRoots()) {
+      removeStyleTag(shadowRoot);
+    }
+    chrome.runtime.sendMessage({ type: "APPLY_CSS", css: "" }).catch(() => {});
+  }
+
+  function injectStyleTag(root, css) {
+    if (!css) return;
+
+    const isDocument = root === document;
+    const parent = isDocument ? document.body || document.documentElement : root;
+
+    removeStyleTag(root);
+
+    const styleEl = document.createElement("style");
+    styleEl.id = STYLE_ID;
+    styleEl.dataset.oklchExtension = "true";
+    styleEl.textContent = css;
+    parent.appendChild(styleEl);
+  }
+
+  async function injectMainCss(css) {
+    injectStyleTag(document, css);
+
+    try {
+      const result = await chrome.runtime.sendMessage({
+        type: "APPLY_CSS",
+        css: css || "",
+      });
+      return result || { ok: true, method: "styleTag" };
+    } catch (error) {
+      return { ok: Boolean(css), method: "styleTag", error: String(error) };
     }
   }
 
-  function applyAdjustments() {
-    if (!scanResult) return;
+  async function applyOverrides() {
+    if (!baseline) return { ok: false, reason: "no baseline" };
 
-    const neutral = isNeutral(adjustments);
-
-    for (const target of scanResult.targets) {
-      const styleEl = ensureOverrideElement(target.root);
-      styleEl.textContent = neutral
-        ? ""
-        : buildStylesheetCss(target.bucket, adjustments);
-      applyInlineOverrides(target.bucket, adjustments);
+    if (isNeutral(adjustments)) {
+      removeAllOverrides();
+      return { ok: true, cssLength: 0 };
     }
-  }
 
-  async function rescanAndApply() {
-    scanResult = await CSSScanner.scanDocument();
-    applyAdjustments();
-    const { merged } = scanResult;
+    const docTarget = baseline.targets.find((t) => t.root === document);
+    const mainCss = docTarget ? buildOverrideCss(docTarget.bucket, adjustments) : "";
+
+    if (!mainCss) {
+      return { ok: false, reason: "empty css" };
+    }
+
+    const result = await injectMainCss(mainCss);
+
+    for (const target of baseline.targets) {
+      if (target.root === document) continue;
+      const css = buildOverrideCss(target.bucket, adjustments);
+      injectStyleTag(target.root, css);
+    }
+
     return {
-      rules: merged.stylesheetRules.length,
-      keyframes: merged.keyframeRules.length,
-      inline: merged.inlineRules.length,
-      warnings: merged.warnings.length,
+      ok: true,
+      cssLength: mainCss.length,
+      method: result?.method,
+      rules: baseline.merged.rules.length,
     };
   }
 
-  function scheduleRescan() {
-    clearTimeout(rescanTimer);
-    rescanTimer = setTimeout(() => {
-      rescanAndApply();
-    }, 400);
+  async function rescanCss() {
+    removeAllOverrides();
+    baseline = await CSSScanner.scanAllCss();
+    await applyOverrides();
+
+    return {
+      rules: baseline.merged.rules.length,
+      keyframes: baseline.merged.keyframes.length,
+      inline: baseline.merged.inlineRules.length,
+    };
   }
 
-  function observeDomChanges() {
-    const observer = new MutationObserver((mutations) => {
-      const relevant = mutations.some((mutation) => {
-        if (mutation.type === "attributes" && mutation.attributeName === "style") {
-          return true;
-        }
-        return mutation.type === "childList";
-      });
-      if (relevant) scheduleRescan();
-    });
-
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["style", "class", "href"],
-    });
+  function getStats() {
+    if (!baseline) return null;
+    return {
+      rules: baseline.merged.rules.length,
+      keyframes: baseline.merged.keyframes.length,
+      inline: baseline.merged.inlineRules.length,
+    };
   }
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message.type === "GET_STATE") {
-      sendResponse({
-        adjustments,
-        stats: scanResult
-          ? {
-              rules: scanResult.merged.stylesheetRules.length,
-              keyframes: scanResult.merged.keyframeRules.length,
-              inline: scanResult.merged.inlineRules.length,
-            }
-          : null,
-      });
-      return;
-    }
+  function registerMessageListener() {
+    if (STATE.listenerRegistered) return;
+    STATE.listenerRegistered = true;
 
-    if (message.type === "SET_ADJUSTMENTS") {
-      adjustments = {
-        hue: Number(message.adjustments?.hue) || 0,
-        lightness: Number(message.adjustments?.lightness) || 0,
-        chroma: Number(message.adjustments?.chroma) || 0,
-      };
-      applyAdjustments();
-      sendResponse({ ok: true });
-      return;
-    }
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message.type === "PING") {
+        sendResponse({ ok: true, stats: getStats() });
+        return;
+      }
 
-    if (message.type === "RESCAN") {
-      rescanAndApply().then(sendResponse);
-      return true;
-    }
-  });
+      if (message.type === "GET_STATE") {
+        sendResponse({ adjustments, stats: getStats() });
+        return;
+      }
+
+      if (message.type === "SET_ADJUSTMENTS") {
+        adjustments = {
+          hue: Number(message.adjustments?.hue) || 0,
+          lightness: Number(message.adjustments?.lightness) || 0,
+          chroma: Number(message.adjustments?.chroma) || 0,
+        };
+
+        (async () => {
+          if (!baseline) await rescanCss();
+          const applied = await applyOverrides();
+          sendResponse({ ok: applied.ok, stats: getStats(), applied });
+        })();
+
+        return true;
+      }
+
+      if (message.type === "RESCAN") {
+        rescanCss().then(sendResponse);
+        return true;
+      }
+    });
+  }
 
   async function init() {
     const stored = await chrome.storage.local.get(["oklchAdjustments"]);
@@ -185,13 +201,23 @@
       adjustments = stored.oklchAdjustments;
     }
 
-    await rescanAndApply();
-    observeDomChanges();
+    if (document.readyState !== "complete") {
+      await new Promise((resolve) => {
+        window.addEventListener("load", resolve, { once: true });
+      });
+    }
+
+    await rescanCss();
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init, { once: true });
-  } else {
-    init();
+  registerMessageListener();
+
+  if (!STATE.initialized) {
+    STATE.initialized = true;
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", () => init(), { once: true });
+    } else {
+      init();
+    }
   }
 })();
