@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "OKLCH Color Changer",
+  "version": "1.0.0",
+  "description": "Pronalazi sve boje na sajtu i menja im hue, lightness i chroma u OKLCH prostoru.",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "OKLCH Color Changer"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/color-utils.js", "content/css-scanner.js", "content/content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "icons": {
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

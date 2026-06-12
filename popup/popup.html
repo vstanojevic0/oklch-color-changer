@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="sr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OKLCH Color Changer</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>OKLCH boje</h1>
+        <p class="subtitle">Menja samo boje na trenutnom sajtu</p>
+      </header>
+
+      <section class="stats" id="stats">Skeniram CSS…</section>
+
+      <section class="slider-group">
+        <label for="hue">
+          <span>Hue</span>
+          <output id="hue-value">0°</output>
+        </label>
+        <input id="hue" type="range" min="-180" max="180" step="1" value="0" />
+      </section>
+
+      <section class="slider-group">
+        <label for="lightness">
+          <span>Lightness</span>
+          <output id="lightness-value">0</output>
+        </label>
+        <input id="lightness" type="range" min="-50" max="50" step="1" value="0" />
+      </section>
+
+      <section class="slider-group">
+        <label for="chroma">
+          <span>Chroma</span>
+          <output id="chroma-value">0</output>
+        </label>
+        <input id="chroma" type="range" min="-50" max="50" step="1" value="0" />
+      </section>
+
+      <footer>
+        <button id="reset" type="button">Reset</button>
+        <button id="rescan" type="button">Ponovo skeniraj</button>
+      </footer>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
